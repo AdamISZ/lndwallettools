@@ -9,7 +9,7 @@ import walletkit_pb2_grpc as walletrpc
 import grpc
 import os
 from binascii import hexlify, unhexlify
-
+from decimal import Decimal
 import codecs
 
 #for transaction creation and verification:
@@ -31,6 +31,8 @@ https://dev.lightning.community/guides/python-grpc/
 bitcoin_net = "mainnet"
 # sighash_all byte for signatures
 sighash_all_bytes = bytes([btc.SIGHASH_ALL])
+# fee in satoshis considered unacceptable
+absurd_fee = 200000
 
 def get_secure_channel():
     # Due to updated ECDSA generated tls.cert we need to let gprc know that
@@ -96,6 +98,39 @@ def get_other_coins():
     to get signatures, of course).
     """
     return []
+
+def estimate_tx_fee(ins, outs, txtype, conftarget, stub, macaroon):
+    """ Given a number of tx inputs, a number of txoutputs, a
+    transaction type (one of "p2pkh", "p2sh-p2wpkh", "p2wpkh",
+    but currently only the last is supported),
+    a targeted number of confirmations, a stub and macaroon for lnd
+    grpc connection to the Lightning service, returns an estimated
+    fee in total satoshis, and an estimated tx size in form (
+    witness bytes, non-witness bytes).
+    TODO Note that all ins/outs are assumed to be the same type.
+    """
+    witness_est, nonwitness_est = btc.estimate_tx_size(
+        ins, outs, txtype=txtype)
+
+    # unfortunately, the rpc call *requires* a destination and amount
+    # in order to estimate an overall fee for the transaction based
+    # on what's in its wallet, even though we only want the fee *rate*
+    # sourced from the blockchain. Here we just give it a dummy
+    # destination and amount, because we don't actually care what its
+    # overall fee estimate for the transaction is.
+    dummy_addr = btc.pubkey_to_p2wpkh_address(btc.privkey_to_pubkey(
+        bytes([1]*33), False))
+    dummy_amt = 300000 # will fail if the wallet can't fund that
+    fee_req = ln.EstimateFeeRequest(AddrToAmount={dummy_addr: dummy_amt},
+                                    target_conf=conftarget)
+    response = stub.EstimateFee(fee_req,
+                                metadata=[('macaroon', macaroon)])
+    fee_per_kb = response.feerate_sat_per_byte
+    fee_est = int((nonwitness_est + 0.25*witness_est)*fee_per_kb)
+    if fee_est > absurd_fee:
+        raise Exception("Unacceptable fee estimated: ", fee_est,
+                        " satoshis.")
+    return fee_est
 
 def main():
 
@@ -164,7 +199,10 @@ def main():
         tx_ins.append(inp["utxo"].outpoint.txid_str + ":" + str(
             inp["utxo"].outpoint.output_index))
         output_amt += inp["utxo"].amount_sat
-    output = {"address": output_address, "value": output_amt - 20000}
+
+    fee_est = estimate_tx_fee(2, 1, "p2wpkh", 6, stub, macaroon)
+
+    output = {"address": output_address, "value": output_amt - fee_est}
     tx_unsigned = btc.mktx(tx_ins, [output], version=2)
     print(btc.deserialize(tx_unsigned))
     
